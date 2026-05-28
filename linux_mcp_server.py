@@ -114,7 +114,6 @@ mcp = FastMCP(
     "Linux VPS Agent",
     host=HOST,
     port=PORT,
-    stateless_http=True,
     json_response=True,
     transport_security=_security,
 )
@@ -135,26 +134,40 @@ def run_command(command: str, session: str = DEFAULT_SESSION,
     _audit("RUN", f"{session} :: {command}")
     _ensure(session)
 
-    uid   = uuid.uuid4().hex[:8]
-    start = f"__S_{uid}__"
-    done  = f"__D_{uid}__"
-    wrapped = f"echo {start}; {command}; echo {done}:$?"
+    # Run inside the session (so cwd/env persist) but capture output and exit
+    # code via temp files - far more robust than scraping the visible pane.
+    uid     = uuid.uuid4().hex[:8]
+    outfile = f"/tmp/mcp_{uid}.out"
+    rcfile  = f"/tmp/mcp_{uid}.rc"
+    wrapped = f"{{ {command} ; }} > {outfile} 2>&1; echo $? > {rcfile}"
     _tmux("send-keys", "-t", session, wrapped, "Enter")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        text = _capture(session)
-        if done in text:
-            i = text.rfind(start)
-            j = text.find(done, i)
-            body = text[i + len(start):j].strip("\n")
-            rc   = text[j + len(done) + 1:].split("\n")[0].strip()
+        if os.path.exists(rcfile):
+            try:
+                rc = open(rcfile).read().strip()
+            except OSError:
+                rc = ""
+            if rc == "":                 # file exists but echo not flushed yet
+                time.sleep(0.1)
+                continue
+            try:
+                out = open(outfile).read()
+            except OSError:
+                out = ""
+            for f in (outfile, rcfile):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
             _audit("DONE", f"{session} :: rc={rc}")
-            return f"[exit code: {rc}]\n{body}"
-        time.sleep(0.4)
+            return f"[exit code: {rc}]\n{out.rstrip()}"
+        time.sleep(0.2)
 
     _audit("TIMEOUT", f"{session} :: {command}")
-    return f"[timeout after {timeout}s - still running]\n{_capture(session)}"
+    return (f"[timeout after {timeout}s - still running] "
+            f"(use capture_pane on session '{session}' to see live output)")
 
 @mcp.tool()
 def send_keys(session: str, keys: str, enter: bool = True) -> str:
